@@ -1,0 +1,1438 @@
+---
+title: "Projet économetrie"
+author: "Gambardello Clara"
+date: "2026-01-25"
+output: pdf_document
+---
+
+# Econométrie spatiale : Auvergne-Rhône-Alpes
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Nettoyage de l'environnement
+rm(list = ls())
+
+#Library
+library(pacman)
+library(ggplot2)
+library(leaflet)
+p_load(here,sf,spdep,robustHD,mapsf,dplyr,spatialreg,GWmodel,tmap)
+
+#Library rajouter 
+library(lmtest)
+
+```
+
+Ce projet vise à analyser les déterminant des dépenses publiques locales en Auvergne-Rhône-Alpes, en prenant explicitement en compte la dimension spatiale des données. Les choix budgétaires des communes pouvant être influencés par ceux des territoires voisins, une approche économétrique spatiale est pertinente.
+
+Les objectifs de ce travail sont les suivants :
+
+-   Identifier les déterminants socio-économiques et fiscaux des dépenses communales.
+
+-   Détecter la présence d'interactions spatiales entre communes.
+
+-   Estimer des modèles économétriques spatiaux (SAR, Durbin) prenant en compte ces dépendances.
+
+```{r, message=FALSE, warning=FALSE}
+## Chargement des données
+load("dat.RData")
+
+# Chargement du fonds de carte
+com <- st_read("commune.shp", quiet = TRUE)
+```
+
+```{r, include=FALSE}
+
+#Nb de lignes et colonnes de dat
+dim(dat)
+
+#Noms des vars
+names(dat)
+
+#Nb de communes dans le shapefile
+dim(com)
+
+#Colonnes du shapefile
+names(com)
+
+```
+
+```{r}
+#Filtrer les données pour la région
+datARA <- dat %>% filter(REG %in% c("82","83"))
+
+#Verification d'avoir tous les départements
+table(datARA$DEP)
+
+#Filtrer pour les départements en question
+dep_ara <- c("01","03","07","15","26","38","42","43","63","69","73","74")
+
+comARA <- com %>% filter(CODE_DEP %in% dep_ara)
+
+#Vérification : carte rapide
+#plot(st_geometry(comARA), main="Carte Auvergne-Rhone-Alpes", cex.main=1.5)
+ggplot(comARA)+ geom_sf(color="black", fill="grey")+
+  labs(title="Carte Auvergne-Rhone-Alpes")+theme_minimal()+
+  theme( plot.title = element_text(size=20, face="bold"))
+```
+
+```{r}
+#Clé commune est : INSEE_COM (shapefile) et CODGEO (données)
+comARA <- merge(comARA,datARA,by.x="INSEE_COM",by.y="CODGEO")
+
+#Nettoyage des objets
+rm(dat,com,datARA)
+```
+
+L'analyse porte sur 4 181 communes de la région.
+
+Nous analysons deux types de dépenses communales par habitant (en logarithme), en fonction de 15 variables explicatives économiques, socio-démographiques, foncières et fiscales.
+
+### Variables dépendantes
+
+-   lCFT_COM = log(dépenses fonctionnement/hab)
+
+-   lDIT_COM = log(dépenses investissement/hab)
+
+### Variables explicatives
+
+-   lPMUN : population municipale (log)
+
+-   lEMPLT : emploi au lieu de travail (log)
+
+-   lSUPERF : superficie de la commune (log, km²)
+
+-   lsurfres : surface urbanisée résidentielle (log, hectares)
+
+-   lsurftot : surface urbanisée dédiée aux activités économiques (log, hectares)
+
+-   TXX_CHOM1564 : taux de chomage (%)
+
+-   TXX_SEUL65P : pourcentage de personnes seules 65+ (%)
+
+-   TXX_RP_LOCHLMV : pourcentage HLM dans les résidences principales (%)
+
+-   TXX_RSECOCC : pourcentage résidences secondaires (%)
+
+-   TXX_LOGVAC : pourcentage logements vacants (%)
+
+-   TXX_APPART : pourcentage des appartements (%)
+
+-   TXX_ENDET : taux endettement (%)
+
+-   lENS_1DEG : NB écoles maternelles et primaires (1er degré) (log)
+
+-   ANNUIDET_COM : Annuité de la dette (euros/hab)
+
+-   prod_3_taxes_com : produit des trois taxes ménages (euros/hab)
+
+-   densité (en log) : population / superficie
+
+## Construction des Matrices de poids spatiales
+
+Nous allons construire trois matrices avec des définitions de voisinage différentes. Elles sont essentielles pour calculer l'autocorrélation spatiale et estimer les modèles économétriques spatiaux.
+
+```{r}
+#Calcul des centroides 
+coords_ara <- st_centroid(st_geometry(comARA))
+```
+
+### Matrice 1 : Contiguité (Queen)
+
+**Définition** : Deux communes sont considérées voisines si elles partagent une **frontière commune** (côté ou coin). Cela correspond au déplacement de la dame aux échecs, on utilisera donc l'argument queen = TRUE.
+
+```{r, echo=TRUE, results='hide'}
+##Matrice contiguité
+#liste des voisins pour chaque polygone avec voisinage de type Queen
+contig_queen <- poly2nb(comARA,queen = T)
+
+#Nb voisins par polygone & polygones isolés
+summary(contig_queen)
+
+
+#Standardisation : somme chq ligne = 1
+#zero.policy=TRUE : gère les polygones sans voisin (évite erreurs)
+W_contig <- nb2listw(contig_queen, style="W", zero.policy=TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+#coordonnées centroides
+coords_mat <- st_coordinates(st_centroid(comARA))
+
+#Dataframe avec liens
+cote <- do.call(rbind,lapply(1:length(contig_queen),function(i){
+  if(length(contig_queen[[i]])==0) return(NULL) #ignorer les "iles"
+  data.frame( x = coords_mat[i,1],y = coords_mat[i,2],
+              xend = coords_mat[contig_queen[[i]],1],yend = coords_mat[contig_queen[[i]],2])
+}))
+
+#Visualisation
+ggplot() + geom_sf(dat =comARA, fill="white", color="black") +
+  geom_segment(data = cote, aes(x = x, y = y, xend = xend, yend = yend), color="red", linewidth=0.3) +
+  ggtitle("Matrice contiguité (Queen)") +theme_minimal()
+
+```
+
+**Interprétation** : Plus les traits rouges sont concentrés dans une zone, plus il y a de communes voisines.
+
+### Matrice 2 : K-plus proches voisins (k = 5 voisins)
+
+**Définition** : Chaque commune est reliée à ses **cinq voisines les plus proches**, calculées selon la distance entre les centroides.
+
+```{r, echo=TRUE, results='hide'}
+#Matrice 5 plus proches voisins
+col_knn5 <- knearneigh(coords_ara, k=5)
+col_nb5 <- knn2nb(col_knn5)
+#summary(col_nb5)
+
+#Standardisation : somme chq ligne = 1
+#Chaque voisin a un poids 1/5
+W_5kn <- nb2listw(col_nb5, style="W", zero.policy=TRUE)
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+#Dataframe avec liens
+cote_knn5 <- do.call(rbind,lapply(1:length(col_nb5),function(i){
+  if(length(col_nb5[[i]])==0) return(NULL) #ignorer si iles
+  data.frame( x = coords_mat[i,1],y = coords_mat[i,2],
+    xend = coords_mat[col_nb5[[i]],1],yend = coords_mat[col_nb5[[i]],2])
+}))
+
+#Visualisation
+ggplot() +
+  geom_sf(dat =comARA, fill="white", color="black") +
+  geom_segment(data = cote_knn5, aes(x = x, y = y, xend = xend, yend = yend), color="blue", linewidth=0.3) +
+  ggtitle("Matrice 5 plus proches voisins") +theme_minimal()
+
+```
+
+**Interprétation** : Cette matrice garantit qu'aucune commune n'est isolée. Elle est particulièrement adaptée aux zones rurales où les communes sont éloignées les unes des autres.
+
+### Matrice 3 : Distance avec seuil
+
+**Définition** : Deux communes sont considérées voisines si la distance entre leurs centroides est inférieure à un seuil fixé. Nous avons testé plusieurs valeurs de seuil (5, 10, 12.5, 15, 20 km).
+
+Un seuil trop faible entrainera un nombre élevé de communes isolées, tandis qu'un seuil trop élevé génère un voisinage trop dense, avec un nombre important de voisins par commune.
+
+```{r, message=FALSE, warning=FALSE}
+#Test de plusieurs distance
+for (d in c(5000, 10000,12000, 12500, 15000, 20000)) {
+  nb <- dnearneigh(coords_ara, 0, d)
+  cat("\nDistance:", d/1000, "km\n")
+  print(summary(card(nb)))
+}
+```
+
+Nous avons finalement choisi de garder le seuil de 12 km. Les seuils inférieurs à cette valeur faisaient apparaitre des communes isolées, tandis que des seuils plus élevés conduisaient à un trop grand nombre de voisins par commune.
+
+Le seuil de 12 km constitue ainsi un compromis satisfaisant : aucune commune isolée, avec un nombre moyen de 29 voisins par commune et un maximum de 69 voisins.
+
+```{r, echo=TRUE, results='hide'}
+#Création de la matrice
+nb_dist12 <- dnearneigh(coords_ara, d1 = 0, d2 = 12000)
+
+#Stats
+summary(nb_dist12)
+
+#Standardisation : somme chq ligne = 1
+#Chaque voisin a un poids 1/5
+#la fonction nb2listw() prend une liste de voisins et la convertit en objet de poids
+W_dist12 <- nb2listw(nb_dist12, style="W", zero.policy=TRUE)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+##Visualisation
+#Dataframe avec liens
+cote_dist12  <- do.call(rbind,lapply(1:length(nb_dist12),function(i){
+  if(length(nb_dist12[[i]])==0) return(NULL) #ignorer si iles
+  data.frame(
+    x = coords_mat[i,1],y = coords_mat[i,2],
+    xend = coords_mat[nb_dist12[[i]],1],yend = coords_mat[nb_dist12[[i]],2])
+}))
+
+#Visualisation
+ggplot() +
+  geom_sf(dat =comARA, fill="white", color="black") +
+  geom_segment(data = cote_dist12, aes(x = x, y = y, xend = xend, yend = yend),
+               color="purple", linewidth=0.3, alpha=0.5) +
+  ggtitle("Matrice distance 12km") + theme_minimal()
+
+```
+
+## Analyse descriptive des variables expliquées
+
+Nous nous intéressons ensuite à l’analyse descriptive spatiale des dépenses communales de fonctionnement et d’investissement par habitant en Auvergne-Rhône-Alpes. L’objectif est d’examiner leur répartition géographique et d’identifier l’existence éventuelle de structures spatiales.
+
+### Cartographie des variables expliquées
+
+```{r}
+# Carte dépenses de fonctionnement
+ggplot(comARA) +
+  geom_sf(aes(fill = lCFT_COM), color = NA) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80") +
+  labs(title = "Dépenses de fonctionnement (log, €/hab)",
+       fill = "fonctionnement") +
+  theme_minimal()
+
+# Carte dépenses d'investissement
+ggplot(comARA) +
+  geom_sf(aes(fill = lDIT_COM), color = NA) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80") +
+  labs(title = "Dépenses d'investissement (log, €/hab)",
+       fill = "investissement") +
+  theme_minimal()
+```
+
+On peut remarquer ici une hétérogénéité sur la région par rapport au dépenses en fonctionnement avec une structure spatiale plus marquée en effet on observe une concentration nette des valeurs élevés sur l'est de la région au niveau de la Savoie de l'Isère ou de la Drôme et un niveau de dépense plus faible sur l'ouest et le centre de la région.
+
+Pour l'investissement en revanche les disparités spatiales sont moins marquées avec toujours une légère augmentation de la dépense sur l'est de la région.
+
+### Statistique descriptive
+
+```{r}
+# Statistiques de base
+summary(comARA$lCFT_COM)
+summary(comARA$lDIT_COM)
+
+# Histogrammes
+ggplot(comARA, aes(x = lCFT_COM)) +
+  geom_histogram(bins = 40, fill = "lightblue") +
+  theme_minimal() +
+  labs(title = "Distribution des dépenses de fonctionnement")
+
+ggplot(comARA, aes(x = lDIT_COM)) +
+  geom_histogram(bins = 40, fill = "lightblue") +
+  theme_minimal() +
+  labs(title = "Distribution des dépenses d'investissement")
+
+```
+
+Les statistiques descriptives et les histogrammes montrent que les dépenses de fonctionnement et d’investissement par habitant varient entre les communes de la région. Les deux distributions sont globalement centrées autour d’un niveau moyen de dépenses. Cependant, on observe une dispersion non négligeable, avec certaines communes qui présentent des montants nettement plus élevés que la moyenne. Les dépenses de fonctionnement apparaissent plus étalées, tandis que les dépenses d’investissement sont un peu plus concentrées autour de leur valeur centrale. Ces résultats confirment l’existence de différences entre les communes et justifient l’analyse spatiale réalisée par la suite pour compléter.
+
+### Autocorrélation spatiale globale (I de Moran)
+
+```{r}
+# I de Moran - Dépenses de fonctionnement
+moran_cft <- moran.test(comARA$lCFT_COM, listw = W_contig, zero.policy = TRUE)
+moran_cft
+
+# I de Moran - Dépenses d'investissement
+moran_dit <- moran.test(comARA$lDIT_COM, listw = W_contig, zero.policy = TRUE)
+moran_dit
+
+```
+
+Les dépenses de fonctionnement par habitant présentent une autocorrélation spatiale positive très forte (I de Moran = 0,545 ; p \< 0,001). Elles sont donc loin d’être distribuées aléatoirement dans l’espace et se structurent sous forme de regroupements géographiques de communes aux niveaux similaires
+
+Les dépenses d’investissement par habitant présentent également une autocorrélation spatiale positive significative (I de Moran = 0,231 ; p \< 0,001), indiquant l’existence de regroupements spatiaux, bien que moins prononcés que pour les dépenses de fonctionnement.
+
+La mise en évidence d’une autocorrélation spatiale globale significative justifie le recours aux statistiques locales de Moran (LISA), afin d’identifier précisément la localisation des clusters de communes à fortes et faibles dépenses
+
+```{r}
+# Standardisation
+comARA$z_lCFT <- scale(comARA$lCFT_COM)[,1]
+comARA$z_lDIT <- scale(comARA$lDIT_COM)[,1]
+
+# Décalages spatiaux
+comARA$W_lCFT <- lag.listw(W_contig, comARA$z_lCFT, zero.policy = TRUE)
+comARA$W_lDIT <- lag.listw(W_contig, comARA$z_lDIT, zero.policy = TRUE)
+
+# Scatterplot Moran - fonctionnement
+ggplot(comARA, aes(x = z_lCFT, y = W_lCFT)) +
+  geom_point(size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  theme_minimal() +
+  labs(title = "Moran scatterplot - Fonctionnement",
+       x = "lCFT_COM standardisé",
+       y = "Retard spatial")
+
+# Scatterplot Moran - investissement
+ggplot(comARA, aes(x = z_lDIT, y = W_lDIT)) +
+  geom_point(size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  theme_minimal() +
+  labs(title = "Moran scatterplot - Investissement",
+       x = "lDIT_COM standardisé",
+       y = "Retard spatial")
+
+```
+
+Les scatterplots de Moran confirment visuellement les résultats des tests d’autocorrélation spatiale. Dans les deux cas, la pente positive de la droite indique que les communes ayant des niveaux élevés (ou faibles) de dépenses sont en moyenne entourées de communes présentant des niveaux similaires. Cette relation est particulièrement marquée pour les dépenses de fonctionnement, ce qui traduit une structuration spatiale plus forte que pour les dépenses d’investissement.
+
+### Statistiques locales LISA
+
+```{r}
+# LISA fonctionnement
+lisa_cft <- localmoran(comARA$lCFT_COM, W_contig, zero.policy = TRUE)
+
+# LISA investissement
+lisa_dit <- localmoran(comARA$lDIT_COM, W_contig, zero.policy = TRUE)
+
+# Ajout dans la base
+comARA$Ii_cft <- lisa_cft[,1]
+comARA$pval_cft <- lisa_cft[,5]
+
+comARA$Ii_dit <- lisa_dit[,1]
+comARA$pval_dit <- lisa_dit[,5]
+
+```
+
+```{r}
+# Fonctionnement
+comARA$cluster_cft <- "Non significatif"
+
+comARA$cluster_cft[
+  comARA$z_lCFT >= 0 & comARA$W_lCFT >= 0 & comARA$pval_cft <= 0.05] <- "Plus-Plus"
+
+comARA$cluster_cft[
+  comARA$z_lCFT <= 0 & comARA$W_lCFT <= 0 & comARA$pval_cft <= 0.05] <- "Moins-Moins"
+
+comARA$cluster_cft[
+  comARA$z_lCFT >= 0 & comARA$W_lCFT <= 0 & comARA$pval_cft <= 0.05] <- "Plus-Moins"
+
+comARA$cluster_cft[
+  comARA$z_lCFT <= 0 & comARA$W_lCFT >= 0 & comARA$pval_cft <= 0.05] <- "Moins-Plus"
+
+
+# Investissement
+comARA$cluster_dit <- "Non significatif"
+
+comARA$cluster_dit[
+  comARA$z_lDIT >= 0 & comARA$W_lDIT >= 0 & comARA$pval_dit <= 0.05] <- "Plus-plus"
+
+comARA$cluster_dit[
+  comARA$z_lDIT <= 0 & comARA$W_lDIT <= 0 & comARA$pval_dit <= 0.05] <- "Moins-Moins"
+
+comARA$cluster_dit[
+  comARA$z_lDIT >= 0 & comARA$W_lDIT <= 0 & comARA$pval_dit <= 0.05] <- "Plus-Moins"
+
+comARA$cluster_dit[
+  comARA$z_lDIT <= 0 & comARA$W_lDIT >= 0 & comARA$pval_dit <= 0.05] <- "Moins-Plus"
+
+```
+
+```{r}
+# Carte LISA fonctionnement
+ggplot(comARA) +
+  geom_sf(aes(fill = cluster_cft), color = NA) +
+  scale_fill_manual(values = c("Plus-PLus" = "red",
+                                "Moins-Moins" = "blue",
+                                "Plus-Moins" = "pink",
+                                "Moins-Plus" = "lightblue",
+                                "Non significatif" = "grey80")) +
+  theme_minimal() +
+  labs(title = "Clusters LISA - Dépenses de fonctionnement",
+       fill = "Type de cluster")
+
+# Carte LISA investissement
+ggplot(comARA) +
+  geom_sf(aes(fill = cluster_dit), color = NA) +
+  scale_fill_manual(values = c("Plus-PLus" = "red",
+                                "Moins-Moins" = "blue",
+                                "Plus-Moins" = "pink",
+                                "Moins-Plus" = "lightblue",
+                                "Non significatif" = "grey80")) +
+  theme_minimal() +
+  labs(title = "Clusters LISA - Dépenses d'investissement",
+       fill = "Type de cluster")
+
+```
+
+Les cartes LISA permettent d’identifier précisément les regroupements spatiaux significatifs au sein de la région Auvergne-Rhône-Alpes. Pour les dépenses de fonctionnement, on observe des clusters High-High principalement dans la partie orientale de la région, notamment en Savoie, Haute-Savoie et dans l’est de l’Isère et de la Drôme, indiquant des zones où les communes à fortes dépenses sont entourées de communes également fortement dépensières. À l’inverse, des clusters Low-Low se concentrent davantage dans la partie occidentale et centrale de la région, notamment dans l’Allier, le Puy-de-Dôme, le Cantal et la Haute-Loire, correspondant à des territoires où les communes présentent globalement de faibles dépenses de fonctionnement. Concernant les dépenses d’investissement, les clusters significatifs sont plus dispersés, avec quelques regroupements de fortes valeurs dans les zones alpines et des regroupements de faibles valeurs dans plusieurs espaces plus ruraux de l’ouest de la région.
+
+
+## Analyse descriptive des variables explicatives
+
+Cette section a pour ojectif de décrire les principales caractéristiques socio-démographiques, économiques et fiscales des communes de la région Auvergne-Rhône-Alpes en 2019. 
+Cette étape permet de mieux comprendre les mécanismes spatiaux au sein de la région et d'expliquer les résultats des modèles économétriques que nous allons appliquer par la suite.
+
+### Signes attendus des variables explicatives
+
+Avant toute analyse, on peut essayer de formuler des hypothèses sur le signe de chaque coefficient si l'on avait ajusté le modèle sur l'ensemble des variables.
+
+#### Variables démographiques et économiques
+
+- Population municipale (lPMUN) : positif. Une population plus importante implique des besoins accrus en équipements collectifs (écoles, crèches, équipements sportifs), voirie, réseaux (eau, assainissement, déchets), administration, transports, ce qui augmente les dépenses par habitant par rapport à une commune moins peuplée.
+- Emploi au lieu de travail (lEMPLT) : positif. Les communes concentrant l’emploi supportent des charges supplémentaires liées aux infrastructure et aux transports, utilisés par des résidents mais aussi par des non-résidents.
+- Taux de chômage (TXX_CHOM1564) : positif. Un taux de chômage plus élevé est généralement associé à la mise en place d'aides sociales, ce qui accroit les dépenses communales.
+
+#### Variables foncières
+
+- Superficie communale (lSUPERF) : positif. Les communes étendues doivent entretenir d'avantage d'infrastructures : voies et réseaux de transport plus long, ce qui augmente les couts.
+- Surface urbanisée résidentielle (lsurfres) : positif. Une urbanisation résidentielle importante demande plus d'équipements collectifs comme des écoles, crèches, espaces verts par exemple. Plus de surfaces résidentielles impliquent aussi plus de couts liés à la collecte des déchets, l'éclairage public et l'entretien des espaces publics.
+- Surface dédiée aux activités économiques (lsurftot) : positif. Une augmentation des activités économiques demande plus d'infrastuctures publiques : routes, éclairage, réseaux.
+
+#### Variables sociales
+
+- Part des personnes âgées vivant seules (TXX_SEUL65P) : positif. Les communes vieillissantes font face à une demande accrue en services sociaux (aide à domicile, portage des repas), en prévention dans le domaine de la santé. Le fait de vivre seul implique aussi une dépendance plus forte à l'action publique.
+- Part de logements sociaux (TXX_RP_LOCHLMV) : positif. Les logements sociaux sont destinés à des ménages à revenus modeste qui sollicient davantage les services sociaux et bénéficient souvent d'accompagnement et d'aides de la part de la commune.
+- Résidences secondaires (TXX_RSECOCC) : negatif. Les résidences secondaires contribuent à la fiscalité locale avec des coûts limités en services publics (écoles, services sociaux) car les résidents ne sont pas présents tout au long de l'année.
+- Logements vacants (TXX_LOGVAC) : négatif. Un taux élevé de vacance réduit le nombre de ménages imposables ce qui peut contraindre les capacités de dépense de la commune. Plus de logments vacants implique aussi un besoin moindre en infrastructures publiques.
+- Part des appartements (TXX_APPART) : positif. Cette variable reflète la densité résidentielle de la commune. De même que pour la variable lsurfres, la densité implique des contraintes comme la gestion du stationnnement, de la propreté, de la circulation etc.
+
+#### Variables budgétaires
+
+- Produit des trois taxes ménages (prod_3_taxe_com) : positif. Une taxe élevée sur les ménages augmente la capacité de financement des dépenses locales.
+- Annuité de la dette (ANNUIDET_COM) : positif. Cette variable correspond aux remboursements annuels des intérêts. Une annuité élevée traduit des dépenses publiques élevées par le passé. 
+- Taux d’endettement (TXX_ENDET) : positif. Plus une commune s'endette et plus elle peut financer des équipements. De plus, plus le taux d'endettement est fort et plus les intérêts à rembourser sont élevés.
+- Équipements d’enseignement du 1er degré (lENS_1DEG) : positif. Les commmunes sont responsables de l'entretien des écoles et des charges qui y sont liées.
+
+### Table 1. Tableau récapitulatif des signes des coefficients attendus
+
+| Variable                | Description                                                | Signe attendu |
+|-------------------------|------------------------------------------------------------|---------------|
+| lPMUN                   | Population municipale                                | +             |
+| lEMPLT                  | Emplois au lieu de travail                         | +             |
+| lSUPERF                  | Superficie de la commune                          | +             |
+| lsurfres                 | Surface urbanisée résidentielle                | +             |
+| lsurftot                 | Surface urbanisée dédiée aux activités économiques  | +             |
+| TXX_CHOM1564             | Taux de chômage                                        | +             |
+| TXX_SEUL65P              | Pourcentages de personnes 65+ vivant seules                              | +             |
+| TXX_RP_LOCHLMV           | Pourcentage de logements sociaux                                        | +             |
+| TXX_RSECOCC              | Pourcentage de résidences secondaires                                   | -     |
+| TXX_LOGVAC               | Pourcentage de logements vacants                                        | -    |
+| TXX_APPART               | Pourcentage d'appartements                                            | +             |
+| lENS_1DEG                | Nombre d’équipements d’enseignement du 1er degré    | +             |
+| prod_3_taxe_com          | Produit des trois taxes ménages                    | +             |
+| ANNUIDET_COM             | Annuité de la dette                                | +             |
+| TXX_ENDET                | Taux d’endettement                                     | +             |
+
+
+### Statistiques descriptives univariées
+
+Nous commençons par une description statistique des variables explicatives afin d’en analyser la dispersion, les ordres de grandeur, la répartition ...
+
+```{r}
+vars_expl <- comARA %>%
+st_drop_geometry() %>%
+select(
+lPMUN, lEMPLT, lSUPERF, lsurfres, lsurftot,
+TXX_CHOM1564, TXX_SEUL65P, TXX_RP_LOCHLMV,
+TXX_RSECOCC, TXX_LOGVAC, TXX_APPART,
+lENS_1DEG, prod_3_taxe_com, TXX_ENDET, ANNUIDET_COM
+)
+summary(vars_expl)
+```
+
+Les statistiques descriptives montrent une forte hétérogénéité d'une commune à une autre. Par exemple pour les variables de taille comme la population municipale (lPMUN), les variables présentent de forts écarts entre le minimum et le maximum malgré l'échelle logarithmique qui permet d'avoir une distribution plus symétrique. 
+Les variables fiscales présentent également une dispersion très importante. Le produit des trois taxes ménages (prod_3_taxe_com) varie de 0 à près de 28 400 euros par habitant, tandis que l’annuité de la dette (ANNUIDET_COM) atteint des valeurs extrêmes pour certaines communes, bien loin de la valeur de la dette moyenne.
+Du côté des variables de logement, la part des résidences secondaires (TXX_RSECOCC) et la part des appartements (TXX_APPART) présentent des distributions très asymétriques, avec des maxima proches de 100 %. Cela prouve la présence sur le territoire Auvergne-Rhone-Alpes de communes très différentes : de communes touristiques à dominante résidentielle secondaire à des communes urbaines denses.
+Enfin, certaines variables présentent des valeurs nulles, notamment le nombre d’équipements d’enseignement du premier degré (lENS_1DEG) et certaines variables fiscales. Ces zéros reflètent principalement la petite taille de nombreuses communes.
+
+### Visualisation des distributions
+
+Afin de mieux comprendre la distribution des variables explicatives présentant une forte hétérogénéité, nous réalisons quelques graphiques.
+
+#### Variables fiscales
+
+Les variables fiscales ont des distributions très asymétriques, on trace par exemple le produit des trois taxes ménagères sous forme d'un boxplot, avec une échelle logarithmique.
+
+```{r, warning=FALSE}
+ggplot(comARA %>% st_drop_geometry(), aes(y = prod_3_taxe_com)) + 
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.alpha = 0.3) + 
+  scale_y_log10() + 
+  labs(title = "Distribution du produit des trois taxes ménages (échelle logarithmique)",
+       y = "Produit des trois taxes (€/hab, log)",
+       x = ""
+       ) +
+  theme_minimal()
+```
+
+On remarque la présence d'une seule commune avec une taxe très élevée par rapport aux autres, tandis qu'une majorité de communes ont des taxes modérées.
+Le même comportement est observé pour l'annuité de la dette.
+
+```{r, warning=FALSE}
+ggplot(comARA %>% st_drop_geometry(),
+       aes(y = ANNUIDET_COM)) +
+  geom_boxplot(fill = "firebrick", alpha = 0.6, outlier.alpha = 0.3) +
+  scale_y_log10() +
+  labs(
+    title = "Distribution de l'annuité de la dette (échelle logarithmique)",
+    y = "Annuité de la dette (€/hab, log)",
+    x = ""
+    ) +
+  theme_minimal()
+```
+
+#### Variable de taille communale
+
+```{r}
+ggplot(comARA %>% st_drop_geometry(),
+aes(x = lPMUN)) +
+geom_histogram(bins = 40, fill = "darkgreen", alpha = 0.7) +
+labs(
+title = "Distribution de la population municipale (log)",
+x = "Population municipale (log)",
+y = "Nombre de communes"
+) +
+theme_minimal()
+
+```
+
+L'histogramme de la population municipale exprimée en logarithme a une distribution en forme de courbe en cloche, ce qui indique que la transformation logarithmique permet bien de corriger l'asymétrie initiale etre les petites communes et les très grosses communes (Lyon, Grenoble ...). Cela renforce sa pertinence dans les modèles économétriques utilisés par la suite qui se basent sur des hypothèses l’hétéroscédasticité faible par exemple.
+
+### Corrélations entre variables explicatives
+
+Avant l'utilisation d'un modèle de prédiction, il peut être intéressant d'évaluer les relations linéaires entre les variables explicatives. Cela permet de guider la sélection des variables dans le modèle : si plusieurs variables représentent un même phénomène, il peut être utile de n'en garder qu'une.
+
+```{r}
+library(corrplot)
+# matrice de corrélation
+cor_mat <- cor(vars_expl, use = "complete.obs")
+# visualisation
+corrplot(cor_mat, method = "color", type = "upper", tl.cex = 0.8, number.cex = 0.7, tl.col = "black",)
+
+```
+
+La matrice de corrélation met en évidence plusieurs liens entre les variables explicatives. On observe notamment que la population municipale (lPMUN) est fortement corrélée avec le nombre d’emplois (lEMPLT) et les surfaces urbanisées (lsurfres, lsurftot). Cela montre que les communes les plus peuplées sont aussi celles qui concentrent le plus d'infrastructures et d'activités. Cette même population est également corrélée avec le nombre d’équipements scolaires du premier degré (lENS_1DEG) et la proportion d’appartements (TXX_APPART), ce qui là aussi parait assez logique.
+À l’inverse, la part de résidences secondaires (TXX_RSECOCC) est négativement corrélée avec la population et à l'emploi, témoignant que les zones rurales et touristiques, moins peuplées, comportent plus de résidences secondaires.
+D’autres variables comme le chômage (TXX_CHOM1564) ou le pourcentage de personnes âgées vivant seules (TXX_SEUL65P) semblent peu liées à la taille ou au type de commune. 
+Enfin, les indicateurs financiers, comme le produit des trois taxes (prod_3_taxe_com) et l’annuité de la dette (ANNUIDET_COM), montrent une forte corrélation, ce qui est cohérent avec le fait que les communes disposant de ressources fiscales plus importantes peuvent rembourser une dette plus élevée.
+
+### Cartographie des variables explicatives
+
+Nous allons ensuite cartographier certaines variables explicatives jugées les plus structurantes par l'analyse préliminaire qui précède :
+
+- la population municipale (taille des communes),
+- le chômage (dimension socio-économique),
+- le produit fiscal des taxes ménages (dimension fiscale),
+- la surface urbanisée résidentielle (type d'urbanisation).
+
+#### Population municipale
+
+```{r}
+tm_shape(comARA) + tm_polygons("lPMUN", style = "quantile", n = 5, title = "Population municipale (log)")
+```
+
+On observe une forte polarisation au sein de la région, avec une population concentrée autour des villes principales : Lyon, Grenible, Saint-Etienne, Clermont-Ferrand. De manière générale, les villes sont plus petites en Auvergne que dans la partie Rhone-Alpes, la population est plus dispersée. Les zones touristiques et stations de montagne (Alpes, Massif Central) ont une population permanente faible mais une population saisonnière élevée.
+
+#### Taux de chômage
+
+```{r}
+tm_shape(comARA) +
+tm_polygons("TXX_CHOM1564", style = "quantile", n = 5,
+title = "Taux de chômage (%)", palette="Reds")
+
+```
+
+Le chomage est plus important au sud ainsi qu'en Auvergne car les communes rurales manquent de diversité économique. On observe aussi que le taux de chomage est plus important au coeur des grandes villes, mais beaucoup plus faible voire inexistant dans les communes autour de ces villes.
+
+#### Produit des trois taxes ménages
+
+```{r}
+tm_shape(comARA) +
+tm_polygons("prod_3_taxe_com", style = "quantile", n = 5,
+title = "Produit fiscal (€/hab)", palette="orange")
+
+```
+
+Les taxes les plus élevées sont dans les grandes villes comme Lyon, Clermont-Ferrand mais aussi dans des petites communes d'Ardèche au Sud-Ouest de la région. Les communes zone à proximité des Alpes à l'Est ont aussi beaucoup de taxes, en raison de leur vaeur foncière importante et des contraintes naturelles qui impliquent des difficultés de maintient des infrastructures.
+
+#### Surface urbanisée résidentielle
+
+```{r}
+tm_shape(comARA) +
+tm_polygons("lsurfres", style = "quantile", n = 5,
+title = "Surface résidentielle (log)", palette="brown")
+
+```
+
+La densité résidentielle est plus importante dans les grandes villes et dans les communes autour. La part de résidentiel est assez faible dans les plus petites communes comme celles d'Auvergne. Les communes touristiques ont parfois une densité résidentielle faible mais une forte occupation saisonnière. 
+
+### Analyse multivariée descriptive
+
+Finalement, pour sythétiser l'information de toutes les variables explicatives, on réalise une Analyse en Composantes Principales (ACP)
+
+```{r}
+
+acp_vars <- prcomp(vars_expl, scale. = TRUE)
+
+summary(acp_vars)
+
+```
+
+#### Graphe de projection des individus
+
+```{r}
+library(factoextra)
+
+fviz_pca_var(acp_vars,
+             col.var = "black",
+             repel = TRUE, 
+             ggtheme = theme_minimal(),
+             arrowsize = 0.8)
+
+```
+
+Le premier axe oppose les communes avec un nombre élevé d'habitants, un fort taux d'emploi au lieu de travail, une surface urbanisée résidentielle et dédiée aux activitées économiques à gauche, aux petites commmunes peu urbanisées avec peu de résidences qui ne proposent pas d'activité économique (à droite).
+Le deuxième axe oppose les communes avec une taxe par ménage forte et une anuité de la dette fortes (en bas) à des communes avec des taxes plus faibles et peu d'intérêts à rembourser.
+
+```{r}
+fviz_pca_ind(acp_vars,
+             geom = "point",
+             pointsize = 2,
+             col.ind = "black",
+             alpha.ind = 0.7,
+             repel = FALSE,
+             ggtheme = theme_minimal())
+```
+
+Le graphe des individus présente une nuage de points densse autour de l'origine, à cause du nombre d'observations très élevées. L'ACP met donc en avant des gradients continus entre les caractéristiques des communes plutôt qu'une typologie discrète de communes.
+
+
+## Estimation d’un modèle de régression linéaire – MCO
+
+Cette partie met en avant l'estimation de modèles de régression linéaire (Moindre Carrés Ordinaires) pour expliquer les dépenses de fonctionnement et d'investissement. Les deux modèles sont donc :
+
+-   Modèle 1 : Dépenses de fonctionnement par habitant (en logarithme)
+
+-   Modèle 2 : Dépenses d'investissement par habitant (en logarithme)
+
+L'objectif est d'identifier les variables déterminantes des dépenses communales, mais aussi de vérifier si le modèle MCO est adapté pour ces données spatiales ou s'il est nécessaire d'utiliser des modèles économétriques plus avancés.
+
+```{r}
+#Modèle pour dépenses de fonctionnement des communes
+mco_fonct <- lm(lCFT_COM ~lPMUN + lEMPLT + lSUPERF + lsurfres + lsurftot + TXX_CHOM1564 +
+                  TXX_SEUL65P + TXX_RP_LOCHLMV + TXX_RSECOCC + TXX_LOGVAC + TXX_APPART +
+                  TXX_ENDET + lENS_1DEG +ANNUIDET_COM + prod_3_taxe_com, data=comARA)
+
+#Modèle pour dépenses d'investissement des communes
+mco_invest <- lm(lDIT_COM  ~lPMUN + lEMPLT + lSUPERF + lsurfres + lsurftot + TXX_CHOM1564 +
+                  TXX_SEUL65P + TXX_RP_LOCHLMV + TXX_RSECOCC + TXX_LOGVAC + TXX_APPART +
+                  TXX_ENDET + lENS_1DEG +ANNUIDET_COM + prod_3_taxe_com, data=comARA)
+
+summary(mco_fonct)
+summary(mco_invest)
+```
+
+#### Résultats des modèles : 
+
+-   **Modèle 1** : Il présente un $R^2$ de 0.690, indiquant que 69% de la variance des dépenses de fonctionnement est expliquée par les variables explicatives. On peut aussi remarquer que la plupart des variables sont significatives (p-value \< 0.05) sauf TXX_LOGVAC et ANNUIDET_COM.
+
+-   **Modèle 2** : Il présente un $R^2$ de 0.293, nettement inférieur au modèle précédent, ce qui peut s'expliquer par le fait que les investissements peuvent être irréguliers et moins récurrents (construction école, achat de matériel...), donc plus difficiles à prédire. On peut aussi remarquer que la plupart des variables sont significatives (p-value \< 0.05) sauf TXX_SEUL65P, TXX_RP_LOCHLMV et lENS_1DEG.
+
+Le test F confirme la significativité globale des modèles.
+
+### Tests de diagnostic
+
+#### 1 - Vérification des hypothèses MCO
+
+Nous allons vérifier les hypothèses du modèle MCO : linéarité de la relation, la normalité des résidus, homoscédasticité (variance constante). Les graphiques de diagnostic permettent de vérifier visuellement ces hypothèses.
+
+```{r}
+par(mfrow = c(2, 2))
+plot(mco_fonct, main = "Dépenses de fonctionnement")
+
+par(mfrow = c(2, 2))
+plot(mco_invest, main = "Dépenses d'investissement")
+par(mfrow = c(1, 1))
+```
+
+Grâce aux graphes standards de diagnostic, on peut souligner plusieurs choses :
+
+-   Présence d'outliers : des points aberrants comme notamment la commune 2199.
+
+-   Légère forme en éventail sur le graphe "Residuals vs Fitted", suggérant de l'hétéroscédasticité.
+
+-   La ligne rouge n'est pas horizontale sur le graphe "Scale Location", confirmant l'hétéroscédasticité.
+
+Vérifions ces observations à l'aide du test suivant.
+
+#### 2 - Test d'hétéroscédasticité (Breusch-Pagan)
+
+L'hypothèse nulle $H_0$ est : "homoscédasticité" (variance constante des erreurs).
+
+```{r}
+#Si p-value < 0.05, présence d'hétéroscédasticité
+print(bptest(mco_fonct))
+print(bptest(mco_invest))
+```
+
+Pour les deux modèles, le test nous fournit une p-value \< 0.001, ce qui signifie que l'hypothèse d'homoscédasticité( $H_0$ ) est rejetée, et l'hypothèse d'hétéroscédasticité acceptée. Les p-values et les intervalles de confiance risquent donc d'être biaisés puisque les erreurs standard sont sous-estimées. Il faudrait utiliser des erreurs standard plus robustes.
+
+#### 3 - Test d'autocorrélation spatiale des résidus
+
+L'hypothèse nulle $H_0$ est : "absence d'autocorrélation spatiale" (les résidus des communes voisines sont indépendants)
+
+```{r, echo=FALSE}
+cat("\nMatrice de contiguïté:\n")
+cat("Dépenses de fonctionnement:\n")
+```
+
+```{r}
+##Si p-value<0.05 -> présence d'autocorrélation spatiale
+moran_fonct_contig <- lm.morantest(mco_fonct, W_contig, zero.policy = TRUE)
+print(moran_fonct_contig)
+```
+
+```{r, echo=FALSE}
+cat("\nDépenses d'investissement:\n")
+```
+
+```{r}
+moran_invest_contig <- lm.morantest(mco_invest, W_contig, zero.policy = TRUE)
+print(moran_invest_contig)
+```
+
+```{r, echo=FALSE}
+#Test avec la matrice 5 plus proches voisins
+cat("\nMatrice 5 plus proches voisins:\n")
+cat("Dépenses de fonctionnement:\n")
+```
+
+```{r}
+moran_fonct_knn <- lm.morantest(mco_fonct, W_5kn, zero.policy = TRUE)
+print(moran_fonct_knn)
+```
+
+```{r, echo=FALSE}
+cat("\nDépenses d'investissement:\n")
+```
+
+```{r}
+moran_invest_knn <- lm.morantest(mco_invest, W_5kn, zero.policy = TRUE)
+print(moran_invest_knn)
+```
+
+```{r, echo=FALSE}
+#Test avec la matrice distance 12km
+cat("\nMatrice distance 12km:\n")
+cat("Dépenses de fonctionnement:\n")
+```
+
+```{r}
+moran_fonct_dist <- lm.morantest(mco_fonct, W_dist12, zero.policy = TRUE)
+print(moran_fonct_dist)
+```
+
+```{r, echo=FALSE}
+cat("\nDépenses d'investissement:\n")
+```
+
+```{r}
+moran_invest_dist <- lm.morantest(mco_invest, W_dist12, zero.policy = TRUE)
+print(moran_invest_dist)
+```
+
+Pour les trois matrices de poids testées, le test de Moran rejette systématiquement l'hypothèse d'absence d'autocorrélation spatiale (p \<0.001). Ce qui signifie que les résidus des deux modèles MCO ne sont pas indépendants : les dépenses d'une commune sont influencées par celles de ses voisines. On pourrait expliquer cela par :
+
+-   Concurrence : les communes ajustent leurs dépenses en fonction de leurs voisines
+
+-   Chocs régionaux communs : politiques départementales, bassins d'emploi partagés.
+
+#### Conclusion :
+
+Les deux modèles sont globalement significatifs et identifient correctement les principaux déterminants des dépenses communales. Malgré tout, plusieurs problèmes peuvent être relevés :
+
+-   Hétéroscédasticité : erreurs standard biaisées.
+
+-   Non-normalité des résidus.
+
+-   Autocorrélation spatiale (principale problème) : Estimateurs biaisés / inefficaces.
+
+Le modèle MCO, bien que fournissant des résultats économiquement intéressants, n'est pas adapté pour ce jeu de données spatiales. La présence d'autocorrélation spatiale forte et significative viole l'hypothèse fondamentale d'indépendance des observations. Ainsi, les dépenses d'une commune sont influencées par celles de ses voisines. Par conséquent, les estimateurs MCO peuvent être biaisés / inefficaces, les erreurs standard sous-estimées et les intervalles de confiance incorrects.
+
+Il est donc nécessaire d'utiliser des modèles économétriques spatiaux qui prennent explicitement en compte les interactions spatiales entre les différentes communes.
+
+
+## Estimation d’un modèle SAR
+
+Un modèle SAR correspond à une régression autorégressive spatiale intégrant les interactions entre unités voisines. Dans notre cas, nous estimons ce modèle en utilisant les méthodes de maximum de vraisemblance et de moindres carrés en deux étapes, appliquées successivement aux trois matrices de poids suivantes : 
+
+- La matrice de coniguité (variable "W_contig")
+- La matrice des 5-plus proches voisins (variable "W_5kn")
+- La matrice des distance avec seuil (variable "W_dist12")
+
+Pour construire les formules de régression, une sélection préalable de variables est réalisée afin de réduire la complexité du modèle et d’accélérer le temps de calcul, en particulier pour la méthode ML.
+
+Pour prédire les dépenses de fonctionnement (ICFT_COM), on choisit 5 variables qui nous sembles expliqué les dépenses de fonctionnement toute en se basant sur les analyses de la partie 4. Les variables choisit sont :
+
+- lPMUN (Population municipale), car plus la population est importante, plus les services publics (état civil, écoles, etc...) sont coûteux.
+
+- lENS_1DEG (Nombre d'équipements d'enseignement du 1er degré), car les écoles génèrent des dépenses de fonctionnement récurrentes importantes (personnel, entretien, chauffage).
+
+- TXX_SEUL65P (Pourcentage de personnes âgées de plus de 65 vivant seules), car c'est les communes avec beaucoup de seniors isolés ont souvent des dépenses de services à la personne plus élevées.
+
+- TXX_RP_LOCHLMV (Pourcentage de logements sociaux), car les communes avec plus de logements sociaux ont souvent des dépenses d'action sociale et de services publics plus importantes.
+
+- prod_3_taxe_com (Produit des trois taxes ménages), car plus de ressources fiscales = capacité à financer plus de fonctionnement.
+
+
+Pour prédire les dépenses d'investissement (IDIT_COM), on procède de la même manière et les variables retenues sont :
+
+- lPMUN (Population municipale), car les grandes communes investissent plus en infrastructures.
+
+- lSUPERF (Superficie de la commune), car plus le territoire est vaste, plus les besoins en réseaux, équipements sont importants.
+
+- lEMPLT (Emplois au lieu de travail), car les communes avec beaucoup d'emplois investissent dans des zones d'activité, infrastructures de transport, parkings.
+
+- TXX_ENDET (Taux d'endettement), car une commune qui s'endette davantage dispose d'une capacité plus élevé à financer des équipements et infrastructures
+
+- prod_3_taxe_com (Produit des trois taxes ménages), car des ressources fiscales plus importantes permettent de financer des projets d'investissement plus ambitieux et d'autofinancer une partie des équipements sans recourir uniquement à l'emprunt.
+
+
+Création des formules pour les régressions :
+
+```{r}
+fm_fonc <- lCFT_COM ~ lPMUN + lENS_1DEG + TXX_SEUL65P + TXX_RP_LOCHLMV + prod_3_taxe_com + factor(DEP)
+```
+
+```{r}
+fm_inv <- lDIT_COM ~ lPMUN + lSUPERF + lEMPLT + TXX_ENDET + prod_3_taxe_com + factor(DEP)
+```
+
+```{r}
+load("dat.RData")
+datARA <- dat %>% filter(REG %in% c("82","83"))
+```
+
+### Estimation du modèle avec ML
+
+#### Avec la matrice de contiguité 
+
+On va tout d'abord prédire les dépenses de fonctionnement se trouvant dans la variable "lCFT_COM" :
+
+```{r}
+mod1_fonc <- lagsarlm(fm_fonc, data=datARA, listw=W_contig, type="lag", method="eigen")
+summary(mod1_fonc)
+```
+
+**Interpretation du coeficient autorégressif :**
+$\rho = 0.536$ avec une p-value significatif du test LR, ce qui suggère une autocorrélation spatial forte.
+Cela signifie que les dépenses de fonctionnement d'une commune sont positivement influencées par celles de ses communes voisines.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod1_fonc <- impacts(mod1_fonc, listw=W_contig, R=1000)
+summary(impacts_mod1_fonc)
+```
+
+On remarque que les effets direct et indirect sont trés proche pour toute les variables.
+En particulier les équipements scolaires ont l'effet le plus marqué, et la variable prod_3_taxe_com l'effet le moins marqué.
+De plus, la population municipale a un effet négatif, c'est à dire une augmentation de 1% de la population dans une commune est associée à une diminution de 0.21% de ses dépenses de fonctionnement par habitant, et à une baisse de 0.22% dans les communes voisines.
+Les effets fixes départementaux varient de -0.12 (Allier) à 0.32 (Haute-Savoie), indiquant que certains départements ont des dépenses plus élevées ou plus faibles, indépendamment des caractéristiques des communes.
+
+
+On va faire la même chose pour les dépenses d'investissement :
+
+```{r}
+mod1_inv <- lagsarlm(fm_inv, data=datARA, listw=W_contig, type="lag", method="eigen")
+summary(mod1_inv)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient $\rho=0.211$ indique une autocorrélation spatiale positive faible mais significative. L'influence des communes voisines sur les dépenses d'investissement est quatre fois moins importante que pour les dépenses de fonctionnement, reflétant le caractère plus stratégique et spécifique des décisions d'investissement.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod1_inv <- impacts(mod1_inv, listw=W_contig, R=1000)
+summary(impacts_mod1_inv)
+```
+
+On observe que les effets indirects sont beaucoup plus faibles que les effets directs pour toutes les variables, ce qui est cohérent avec la plus faible autocorrélation spatiale. Le taux d'endettement présente l'impact total le plus élevé (0.45) : l'effet direct (0.36) montre qu'une augmentation de 1% du taux d'endettement entraîne une hausse de 0.36% des dépenses d'investissement dans la commune, tandis que l'effet indirect reste limité (0.09), indiquant peu d'influence sur les investissements des voisines. 
+La population municipale affiche un effet direct négatif important (-0.40) : les grandes communes investissent moins par habitant, l'effet indirect est également négatif (-0.10), suggérant une certaine homogénéité spatiale. Enfin, la variable prod_3_taxe_com présente l'effet le plus faible (0.0003 au total), avec un effet direct de 0.0002 et indirect de 0.00006, indiquant qu'elle joue un rôle négligeable dans les décisions d'investissement comparé à l'endettement.
+
+#### Avec la matrice des 5-plus proches voisins
+
+```{r}
+mod2_fonc <- lagsarlm(fm_fonc, data=datARA, listw=W_5kn, type="lag", method="eigen")
+summary(mod2_fonc)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient $\rho=0.528$ avec la matrice 5-NN confirme l'autocorrélation spatiale forte observée avec la matrice de contiguïté . Les deux matrices donnent des résultats très similaires.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod2_fonc <- impacts(mod2_fonc, listw=W_5kn, R=1000)
+summary(impacts_mod2_fonc)
+```
+
+Avec la matrice des voisins, les résultats sont similaires à ceux obtenus précédemment. Les écoles ont l'effet le plus fort (0.52), avec une influence identique sur la commune et ses voisines. La population a un effet négatif (-0.42), les grandes communes dépensent moins par habitant. Les recettes fiscales ont un impact presque nul (0.0006).
+
+
+```{r}
+mod2_inv <- lagsarlm(fm_inv, data=datARA, listw=W_5kn, type="lag", method="eigen")
+summary(mod2_inv)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient autorégressif est égale à $\rho=0.205$ et est statistiquement significatif. Cette valeur révèle une
+autocorrélation spatiale positive faible. Le coefficient autorégressif est encore plus faible qu'avec la matrice de contiguité. Et a nouveau il est plus faible que pour les dépenses de onctionnement certainement pour les même raisons que précédement.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod2_inv <- impacts(mod2_inv, listw=W_5kn, R=1000)
+summary(impacts_mod2_inv)
+```
+
+Le taux d'endettement domine (0.45) avec un effet surtout local (direct=0.36, indirect=0.09), montrant que l'endettement d'une commune est principalement du au les projets de la commune. L'emploi a un effet total de 0.32, concentré localement (0.26). La population reste négative (-0.50), indiquant qu'une commune plus peuplée investit moins par habitant.
+Les résultats confirment ceux obtenus précédemment.
+
+#### Avec la matrice des distance avec seuil
+
+```{r}
+mod3_fonc <- lagsarlm(fm_fonc, data=datARA, listw=W_dist12, type="lag", method="eigen")
+summary(mod3_fonc)
+```
+
+**Interpretation du coeficient autorégressif :**
+$\rho=0.670$ et la p-value est significative. L'autocorrélation spatiale est très forte. Ce résultat indique que les dépenses de fonctionnement sont très similaires entre communes situées à proximité les unes des autres.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod3_fonc <- impacts(mod3_fonc, listw=W_dist12, R=1000)
+summary(impacts_mod3_fonc)
+```
+
+Avec la matrice de distance, on observe une autocorrélation spatiale marquée traduite par des effets indirects importants. Les équipements scolaires constituent le principal déterminant des dépenses de fonctionnement, avec un effet total de 0.75, majoritairement diffusé vers les communes voisines.
+La population municipale a un effet négatif très fort (-0.59), confirmant l’existence d’économies d’échelle. Cet effet est même plus marqué chez les communes voisines que localement.
+Les variables climatiques ont un impact positif mais modéré, tandis que les recettes fiscales jouent un rôle négligeable.
+Enfin, les effets fixes départementaux montrent d’importantes disparités territoriales, avec des écarts allant de -0.15 à 0.35, traduisant toujours des différences structurelles persistantes.
+
+
+```{r}
+mod3_inv <- lagsarlm(fm_inv, data=datARA, listw=W_dist12, type="lag", method="eigen")
+summary(mod3_inv)
+```
+
+**Interpretation du coeficient autorégressif :**
+$\rho=0.396$ et la p-value est significative. L'autocorrélation spatiale est positive mais modérée, nettement supérieure à celle obtenue avec les matrices de contiguïté et 5-NN. La matrice de distance permet de regrouper des communes plus similaires. Encore une fois, $\rho$ reste plus faible que dans le modèle pour les dépenses de fonctionnement.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod3_inv <- impacts(mod3_inv, listw=W_dist12, R=1000)
+summary(impacts_mod3_inv)
+```
+
+Le taux d’endettement est le facteur le plus important. Son effet total est de 0.58, ce qui signifie que plus une commune est endettée, plus elle investit. Cet effet est surtout direct (0.35) : l’endettement sert certainement avant tout à financer les projets de la commune. L’effet indirect (0.23) montre cependant que ces choix ont aussi un impact sur les communes voisines.
+L’emploi a également un effet positif (0.41 au total). L’effet direct (0.25) indique que les communes où il y a plus d’emplois investissent davantage. L’effet indirect (0.16) montre que ce dynamisme profite aussi aux communes voisines.
+À l’inverse, la population municipale a un effet négatif important (-0.61). Cela signifie que les grandes communes investissent moins par habitant. Cet effet est surtout local (-0.37), mais il se diffuse aussi aux communes voisines (-0.24), ce qui suggère que les communes proches ont des comportements similaires.
+
+**Conclusion pour ce modèle :**
+
+Les dépenses de fonctionnement présentent une forte dépendance spatiale. Les communes proches ont des niveaux de dépenses similaires, en particulier avec la matrice de distance. Les équipements scolaires apparaissent comme le principal facteur explicatif, tandis que la population exerce un effet négatif. Les recettes fiscales jouent un rôle négligeable et des disparités territoriales persistent entre départements.
+
+Les dépenses d’investissement montrent une dépendance spatiale plus modérée. L’endettement constitue le déterminant principal, confirmant que l’investissement est principalement financé par l’emprunt. L’emploi a également un effet positif, alors que la population a un impact négatif.
+
+
+### Estimation du modèle avec 2SLS
+
+#### Avec la matrice de coniguité 
+
+```{r}
+mod4_fonc <- stsls(fm_fonc, data=datARA, listw=W_contig, robust=TRUE)
+summary(mod4_fonc)
+```
+
+**Interpretation du coeficient autorégressif :**
+Il existe un effet spatial positif marqué ($\rho = 0.62$). Les dépenses de fonctionnement d’une commune sont fortement influencées par celles de ses communes voisines. De plus, la p-value est significative.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod4_fonc <- impacts(mod4_fonc, listw=W_contig, R=1000)
+summary(impacts_mod4_fonc)
+```
+
+L’analyse des impacts montre une autocorrélation spatiale marquée. La population municipale réduit les dépenses de fonctionnement locales et dans les communes voisines, tandis que les équipements scolaires les augmentent de manière significative. Le taux de personnes âgées et le taux de logements ont un effet positif mais faible, et les recettes fiscales jouent un rôle négligeable. Les effets fixes départementaux montrent des disparités entre départements, mais pour chaque département, l’effet direct et indirect sont quasiment identique.
+
+```{r}
+mod4_inv <- stsls(fm_inv, data=datARA, listw=W_contig, robust=TRUE)
+summary(mod4_inv)
+```
+
+**Interpretation du coeficient autorégressif :**
+Il existe un effet spatial positif modéré ($\rho = 0.43$) : les dépenses d’investissement d’une commune sont influencées par celles de ses communes voisines, mais cet effet est moins fort que pour les dépenses de fonctionnement, ce qui suggère que les dépenses d'
+investissements sont moins "contagieuse" spatialement que les dépenses courantes.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod4_inv <- impacts(mod4_inv, listw=W_contig, R=1000)
+summary(impacts_mod4_inv)
+```
+
+La population municipale réduit les dépenses d’investissement à la fois dans la commune (-0,36) et dans les communes voisines (-0,25), traduisant une certaine homogénéité spatiale. La superficie des communes et l’emploi ont des effets positifs modérés, avec des impacts totaux de 0,17 et 0,41, et des effets indirects plus faibles. Le taux d’endettement exerce l’effet le plus fort (0,62), réparti entre un effet direct (0,37) et indirect (0,25), indiquant que les communes endettées investissent davantage et que cette dynamique profite aussi aux communes voisines. Encore une fois les recettes fiscales jouent un rôle négligeables.
+Les effets fixes départementaux montrent des disparités plus marquées que pour les dépenses de fonctionnement.
+
+#### Avec la matrice des 5-plus proches voisins
+
+```{r}
+mod5_fonc <- stsls(fm_fonc, data=datARA, listw=W_5kn, robust=TRUE)
+summary(mod5_fonc)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient $\rho = 0.639$ est fortement positif et significatif, ce qui confirme que les dépenses de fonctionnement d’une commune sont fortement influencées par celles de ses voisines, les résultats étant très similaires à ceux obtenus avec la matrice de coniguité.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod5_fonc <- impacts(mod5_fonc, listw=W_5kn, R=1000)
+summary(impacts_mod5_fonc)
+```
+
+La population municipale réduit les dépenses de fonctionnement locales (-0,20) et dans les communes voisines (-0,30), tandis que les équipements scolaires augmentent fortement ces dépenses (0,26 direct, 0,39 indirect). Le taux de personnes âgées et le taux de logements ont des effets positifs mais faibles, et les recettes fiscales jouent un rôle négligeable.
+
+```{r}
+mod5_inv <- stsls(fm_inv, data=datARA, listw=W_5kn, robust=TRUE)
+summary(mod5_inv)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient $\rho = 0.413$ est positif et également significatif, indiquant que les dépenses d'investissements dépendent des communes voisines, avec un effet légèrement plus faible que pour les dépenses de fonctionnement, mais cohérent avec les résultats de la première matrice de poids.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod5_inv <- impacts(mod5_inv, listw=W_5kn, R=1000)
+summary(impacts_mod5_inv)
+```
+
+L’analyse des impacts avec la matrice 5-NN confirme les mêmes tendances que précédemment avec la matrice de contiguité.
+
+
+#### Avec la matrice des distance avec seuil
+
+```{r}
+mod6_fonc <- stsls(fm_fonc, data=datARA, listw=W_dist12, robust=TRUE)
+summary(mod6_fonc)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient $\rho = 0.677$ est fortement positif et significatif, indiquant une autocorrélation spatiale importante : les dépenses de fonctionnement d’une commune sont fortement influencées par celles des communes proches, un résultat cohérent avec celui obtenu avec les autres matrices.
+
+**Analyse des impacts :** 
+
+```{r}
+impacts_mod6_fonc <- impacts(mod6_fonc, listw=W_dist12, R=1000)
+summary(impacts_mod6_fonc)
+```
+
+L’analyse des impacts montre une autocorrélation spatiale très marquée. La population municipale réduit les dépenses (-0,20 direct, -0,40 indirect), tandis que les équipements scolaires ont un effet positif fort (0,25 direct, 0,51 indirect), montrant une large diffusion vers les communes voisines. Les autres variables ont des effets positifs faibles, et les recettes fiscales restent négligeables. Les effets fixes départementaux varient de -0,15 (03) à 0,35 (74), avec direct et indirect presque identiques. Comparé aux modèles précédents avec les matrices de contiguïté ou 5-NN, la matrice de distance accentue les effets indirects, ce qui traduit une plus forte homogénéité spatiale sur les communes proches.
+
+```{r}
+mod6_inv <- stsls(fm_inv, data=datARA, listw=W_dist12, robust=TRUE)
+summary(mod6_inv)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient $\rho = 0.551$ est positif et encore une fois significatif, montrant une autocorrélation spatiale élevé : les dépenses d' investissements d’une commune dépendent de celle des communes proches, confirmant la tendance observée avec les matrices de contiguïté et 5-NN, mais avec un effet un peu plus marqué que précédemment.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod6_inv <- impacts(mod6_inv, listw=W_dist12, R=1000)
+summary(impacts_mod6_inv)
+```
+
+La population réduit les investissements (-0,35 direct, -0,41 indirect), tandis que le taux d’endettement reste le facteur le plus influent (0,35 direct, 0,42 indirect), indiquant que les communes endettées investissent davantage et que cet impact se diffuse vers les voisines. L’emploi et la superficie ont des effets positifs modérés, et les recettes fiscales restent négligeables. Comparé aux matrices précédentes, les effets indirects sont plus élevés, montrant que la matrice de distance capture mieux l’influence des communes proches.
+
+**Conclusion sur les deux méthodes :**
+
+L'analyse comparative des méthodes d'estimation par maximum de vraisemblance et par doubles moindres carrés révèle une cohérence globale des résultats, mais avec ceratines nuances.
+
+Les deux méthodes confirment l'existence d'une forte autocorrélation spatiale pour les dépenses de fonctionnement et d'une autocorrélation plus modérée pour les dépenses d'investissement.Dans les deux cas, la matrice de distance avec seuil capture le mieux les interactions spatiales.
+Les déterminants majeurs identifiés sont identiques : les équipements scolaires pour les dépenses de fonctionnement et le taux d'endettement pour les dépenses d'investissement. La population municipale exerce systématiquement un effet négatif, traduisant des économies d'échelle, tandis que les recettes fiscales jouent un rôle négligeable dans tous les modèles.
+En revanche, les coefficients autorégressifs estimés par 2SLS sont systématiquement plus élevés que ceux obtenus par ML.L'analyse des impacts révèle également des effets indirects plus prononcés avec la méthode 2SLS, particulièrement pour les dépenses d'investissement, suggérant que cette méthode capte mieux les effets de diffusion spatiale.
+
+On remarque en revanche, un temps de calcul moins long pour la méthode des doubles moindres carrés !
+
+
+## Estimation d’un modèle de Durbin
+
+Le modèle de Durbin spatial est un modèle économétrique qui intègre à la fois la variable dépendante retardée spatialement et les variables explicatives retardées spatialement, permettant ainsi de capturer simultanément les effets de débordement (spillovers) entre communes voisines et l'influence directe des caractéristiques des communes environnantes. 
+
+Dans cette section, nous estimons ce modèle en créant des variables décalées spatialement pour la population (lPMUN_dec) et l'emploi (lEMPLT_dec) à l'aide de la fonction lag.listw(), qui calcule pour chaque commune la moyenne pondérée des valeurs de ses voisins selon trois matrices de proximité différentes : contiguïté, 5 plus proches voisins, et distance inverse.
+
+On crée d'abord les variables décalées :
+
+```{r}
+datARA$lPMUN_dec1 <- lag.listw(W_contig, datARA$lPMUN)
+datARA$lEMPLT_dec1 <- lag.listw(W_contig, datARA$lEMPLT)
+
+datARA$lPMUN_dec2 <- lag.listw(W_5kn, datARA$lPMUN)
+datARA$lEMPLT_dec2 <- lag.listw(W_5kn, datARA$lEMPLT)
+
+datARA$lPMUN_dec3 <- lag.listw(W_dist12, datARA$lPMUN)
+datARA$lEMPLT_dec3 <- lag.listw(W_dist12, datARA$lEMPLT)
+```
+
+On réecrit nos formules en remplacent prod_3_taxe_com (qui n'était pas trés concluante dans la partie 5) par la variable décalé lEMPLT_dec, car elle ne figurait pas dans la formule pour les dépenses de fonctionnement auparavent.
+
+```{r}
+fm_fonc_dec1 <- lCFT_COM ~ lPMUN_dec1 + lENS_1DEG + TXX_SEUL65P + TXX_RP_LOCHLMV + lEMPLT_dec1 + factor(DEP)
+fm_inv_dec1 <- lDIT_COM ~ lPMUN_dec1 + lSUPERF + lEMPLT_dec1 + TXX_ENDET + prod_3_taxe_com + factor(DEP)
+```
+
+```{r}
+fm_fonc_dec2 <- lCFT_COM ~ lPMUN_dec2 + lENS_1DEG + TXX_SEUL65P + TXX_RP_LOCHLMV + lEMPLT_dec2 + factor(DEP)
+fm_inv_dec2 <- lDIT_COM ~ lPMUN_dec2 + lSUPERF + lEMPLT_dec2 + TXX_ENDET + prod_3_taxe_com + factor(DEP)
+```
+
+```{r}
+fm_fonc_dec3 <- lCFT_COM ~ lPMUN_dec3 + lENS_1DEG + TXX_SEUL65P + TXX_RP_LOCHLMV + lEMPLT_dec3 + factor(DEP)
+fm_inv_dec3 <- lDIT_COM ~ lPMUN_dec3 + lSUPERF + lEMPLT_dec3 + TXX_ENDET + prod_3_taxe_com + factor(DEP)
+```
+
+
+### Estimation du modèle avec ML
+
+#### Avec la matrice de coniguité 
+
+On commence comme dans la partie précédente par ajuster un modèle pour les dépenses de fonctionnement :
+
+```{r}
+mod1_fonc_dec <- lagsarlm(fm_fonc_dec1, data=datARA, listw=W_contig, type="lag", method="eigen")
+summary(mod1_fonc_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+On a $\rho=0.62276$. Le coefficient autorégressif est fortement positif et trés significatif.
+Cela indique une forte dépendance spatiale. Les dépenses de fonctionnement d’une commune sont fortement influencées par celles de ses communes voisines.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod1_fonc_dec <- impacts(mod1_fonc_dec, listw=W_contig, R=1000)
+summary(impacts_mod1_fonc_dec)
+```
+
+Dans ce modèle, la population moyenne des communes voisines réduit les dépenses actuelles, avec un effet total d'environ -0,68, dont une part importante provient des effets indirects (-0,40), ce qui montre que les communes voisines amplifient ce mécanisme. À l'inverse, l'emploi moyen des communes voisines augmente fortement les dépenses, avec un effet total proche de 0,36, composé d'un effet direct de 0,15 et d'un effet indirect de 0,21, ce qui indique que l'activité économique des communes proches influence les dépenses locales. Les variables sociales ont des effets plus faibles, autour de 0,02 à 0,04, mais restent positifs. Enfin, certains départements comme le 38, 73 et le 74 affichent des niveaux structurellement plus élevés de dépenses.
+
+Puis on fait la même choses avec les dépenses d'investissement :
+
+```{r}
+mod1_inv_dec <- lagsarlm(fm_inv_dec1, data=datARA, listw=W_contig, type="lag", method="eigen")
+summary(mod1_inv_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+On a $\rho=0.20031$ et le coefficient autorégressif est positif mais nettement plus faible que pour les dépenses de fonctionnement.
+Cela montre une autocorrélation spatiale faible mais significative. Les décisions d’investissement dépendent donc des communes voisines, mais dans une moindre mesure que pour les dépenses de fonctionnement.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod1_inv_dec <- impacts(mod1_inv_dec, listw=W_contig, R=1000)
+summary(impacts_mod1_inv_dec)
+```
+
+Les dépenses d'investissement réagissent de manière similaire, la population moyenne des communes voisines réduit l'investissement avec un effet total d'environ -0,55, principalement dû à l'effet direct (-0,45). L'emploi moyen des communes voisines (0,38) et surtout l'endettement (0,43) augmentent la capacité d'investissement, avec des effets directs largement majoritaires. La superficie contribue aussi positivement (0,10). Les départements 73 et 74 se distinguent nettement, avec des effets totaux proches de 0,42 et 0,45, confirmant des niveaux d'investissement supérieurs.
+
+
+#### Avec la matrice des 5-plus proches voisins
+
+```{r}
+mod2_fonc_dec <- lagsarlm(fm_fonc_dec2, data=datARA, listw=W_5kn, type="lag", method="eigen")
+summary(mod2_fonc_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+On retrouve une forte autocorrélation spatiale ($\rho=0.61556$), très proche de celle obtenue avec la matrice de contiguïté.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod2_fonc_dec <- impacts(mod2_fonc_dec, listw=W_5kn, R=1000)
+summary(impacts_mod2_fonc_dec)
+```
+
+Avec la matrice 5-NN, la population moyenne des 5 communes voisines les plus proches réduit les dépenses avec un effet total d'environ -0,64, dont une part indirecte de -0,37, ce qui montre une influence forte des communes voisines. L'emploi moyen des 5 communes voisines les plus proches augmente les dépenses (0,33), avec un équilibre entre effet direct (0,14) et indirect (0,19). Les effets sociaux restent faibles, et les départements 38, 73 et 74 conservent des niveaux structurellement plus élevés.
+
+```{r}
+mod2_inv_dec <- lagsarlm(fm_inv_dec2, data=datARA, listw=W_5kn, type="lag", method="eigen")
+summary(mod2_inv_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient est quasiment identique à celui obtenu avec la matrice de contiguïté. Les choix d’investissement restent principalement locaux.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod2_inv_dec <- impacts(mod2_inv_dec, listw=W_5kn, R=1000)
+summary(impacts_mod2_inv_dec)
+```
+
+Pour l'investissement, la population moyenne des 5 communes voisines les plus proches réduit les montants investis (-0,55), avec un effet direct dominant (-0,45). L'emploi moyen des 5 communes voisines les plus proches (0,38) et l'endettement (0,43) les augmentent, avec des effets indirects modestes mais présents. La superficie a un effet positif d'environ 0,11, et les départements 73 et 74 restent les plus dynamiques.
+
+
+#### Avec la matrice des distance avec seuil
+
+```{r}
+mod3_fonc_dec <- lagsarlm(fm_fonc_dec3, data=datARA, listw=W_dist12, type="lag", method="eigen")
+summary(mod3_fonc_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+$\rho=0.78056$ est un coefficient qui est très élevé, le plus fort parmi toutes les matrices.
+Cela révèle une autocorrélation spatiale extrêmement forte. Les communes situées à proximité géographique ont des niveaux de dépenses de fonctionnement très similaires.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod3_fonc_dec <- impacts(mod3_fonc_dec, listw=W_dist12, R=1000)
+summary(impacts_mod3_fonc_dec)
+```
+
+Avec la matrice de distance, les effets indirects deviennent très importants. La population moyenne des communes voisines, pondérée par la distance, réduit fortement les dépenses (-1,32), avec un effet indirect très important (-1,01), ce qui montre une diffusion spatiale beaucoup plus large. L'emploi moyen des communes voisines exerce un effet total élevé (0,84), dont une grande partie provient aussi des effets indirects (0,64).
+
+
+```{r}
+mod3_inv_dec <- lagsarlm(fm_inv_dec3, data=datARA, listw=W_dist12, type="lag", method="eigen")
+summary(mod3_inv_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+Ici aussi, le coefficient est plus élevé que pour les matrices précédentes. L’autocorrélation spatiale est modérée.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod3_inv_dec <- impacts(mod3_inv_dec, listw=W_dist12, R=1000)
+summary(impacts_mod3_inv_dec)
+```
+
+Pour l'investissement, la population moyenne des communes voisines, pondérée par la distance, réduit les montants investis (-0,72), avec un effet direct plus élevé. L'emploi moyen des communes voisines (0,49), l'endettement (0,54) et la superficie (0,12) augmentent les dépenses d'investissement, avec des effets indirects plus visibles que dans les autres matrices.
+
+### Estimation du modèle avec 2SLS
+
+#### Avec la matrice de coniguité 
+
+
+```{r}
+mod4_fonc_dec <- stsls(fm_fonc_dec1, data=datARA, listw=W_contig, robust=TRUE)
+summary(mod4_fonc_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient autorégressif est $\rho=0.947$ et est extrêmement élevé et hautement significatif.
+Cela indique une dépendance spatiale très forte : les dépenses de fonctionnement d’une commune sont presque proportionnellement déterminées par celles de ses voisines. 
+Comparé à l’estimation avec ML, la valeur est nettement plus élevée, ce qui montre que la méthode 2SLS amplifie l’intensité des interactions spatiales.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod4_fonc_dec <- impacts(mod4_fonc_dec, listw=W_contig, R=1000)
+summary(impacts_mod4_fonc_dec)
+```
+
+Dans ce modèle, la population moyenne des communes voisines augmente légèrement les dépenses de fonctionnement, avec un effet total d'environ 0,23, mais cet impact provient presque entièrement des effets indirects (0,21), ce qui montre que ce sont surtout les communes voisines qui transmettent cette influence. À l'inverse, l'emploi moyen des communes voisines réduit fortement les dépenses, avec un effet total de -1,39, dont une très grande partie indirecte (-1,28), ce qui suggère une dynamique spatiale marquée. Les variables sociales ont des effets positifs modérés, et plusieurs départements, notamment le 42, 69 et le 74, présentent des niveaux structurellement plus élevés de dépenses de fonctionnement, principalement via des effets indirects très importants.
+
+```{r}
+mod4_inv_dec <- stsls(fm_inv_dec1, data=datARA, listw=W_contig, robust=TRUE)
+summary(mod4_inv_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient est positif, modéré et significatif. Les décisions d’investissement sont donc clairement influencées par celles des communes voisines, beaucoup plus fortement que dans l’estimation ML.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod4_inv_dec <- impacts(mod4_inv_dec, listw=W_contig, R=1000)
+summary(impacts_mod4_inv_dec)
+```
+
+Pour les dépenses d'investissement, la population moyenne des communes voisines réduit les montants investis, avec un effet total d'environ -0,49, composé d'un effet direct de -0,27 et d'un effet indirect de -0,22. L'emploi moyen des communes voisines augmente l'investissement (0,31), avec une contribution indirecte notable (0,14). L'endettement reste le moteur principal, avec un effet total élevé (0,65), dont près de la moitié provient des interactions spatiales. La superficie joue aussi positivement (0,13).
+
+
+#### Avec la matrice des 5-plus proches voisins
+
+```{r}
+mod5_fonc_dec <- stsls(fm_fonc_dec2, data=datARA, listw=W_5kn, robust=TRUE)
+summary(mod5_fonc_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+On observe à nouveau une très forte autocorrélation spatiale ($\rho=0.9518$).
+Les communes proches (selon la distance) ont des niveaux de dépenses de fonctionnement très similaires.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod5_fonc_dec <- impacts(mod5_fonc_dec, listw=W_5kn, R=1000)
+summary(impacts_mod5_fonc_dec)
+```
+
+Avec la matrice des 5 plus proches voisins, la population moyenne des 5 communes voisines les plus proches augmente les dépenses avec un effet total d'environ 0,32, dominé par un effet indirect important (0,29), ce qui montre une influence forte entre communes similaires. L'emploi moyen des 5 communes voisines les plus proches a un effet négatif important (-1,42), et là encore les effets indirects dominent (-1,31). Les variables sociales restent positives mais faibles.
+
+```{r}
+mod5_inv_dec <- stsls(fm_inv_dec2, data=datARA, listw=W_5kn, robust=TRUE)
+summary(mod5_inv_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+$\rho=0.476$ est positif et significatif, légèrement plus élevé que pour la matrice de contiguïté.
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod5_inv_dec <- impacts(mod5_inv_dec, listw=W_5kn, R=1000)
+summary(impacts_mod5_inv_dec)
+```
+
+Pour les dépenses d'investissement, la population moyenne des 5 communes voisines les plus proches réduit les montants investis (-0,51), avec un équilibre entre effets directs (-0,28) et indirects (-0,23). L'emploi moyen des 5 communes voisines les plus proches augmente l'investissement (0,33). L'endettement reste le facteur le plus déterminant, avec un effet total élevé de 0,65. Les départements 73 et 74 affichent encore des niveaux d'investissement supérieurs.
+
+#### Avec la matrice des distance avec seuil
+
+```{r}
+mod6_fonc_dec <- stsls(fm_fonc_dec3, data=datARA, listw=W_dist12, robust=TRUE)
+summary(mod6_fonc_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+Le coefficient ($\rho=0.8925$) reste très élevé, confirmant une autocorrélation spatiale extrêmement forte.
+Les communes géographiquement proches ont des comportements budgétaires très homogènes. (Même si pour une fois la matrice de distance ne donne pas l'estimation de $\rho$ la plus élevé !).
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod6_fonc_dec <- impacts(mod6_fonc_dec, listw=W_dist12, R=1000)
+summary(impacts_mod6_fonc_dec)
+```
+
+Avec la matrice de distance, les effets indirects deviennent extrêmement importants. La population moyenne des communes voisines (pondérée par la distance) réduit fortement les dépenses (-1,57), avec un effet indirect massif (-1,38), ce qui montre une diffusion spatiale très large. L'emploi moyen des communes voisines (pondéré par la distance), au contraire, augmente fortement les dépenses (0,80), et cet impact provient presque entièrement des effets indirects (0,70). Les départements 38, 42, 73 et surtout 74 présentent des niveaux structurellement plus élevés, principalement via des effets indirects, ce qui confirme une forte cohérence budgétaire (de fonctionnement) entre communes proches géographiquement.
+
+```{r}
+mod6_inv_dec <- stsls(fm_inv_dec3, data=datARA, listw=W_dist12, robust=TRUE)
+summary(mod6_inv_dec)
+```
+
+**Interpretation du coeficient autorégressif :**
+Ici, le coefficient ($\rho=0.598$) est élevé, bien supérieur aux estimations ML. Cela indique une dépendance spatiale forte des investissements
+
+**Analyse des impacts :**
+
+```{r}
+impacts_mod6_inv_dec <- impacts(mod6_inv_dec, listw=W_dist12, R=1000)
+summary(impacts_mod6_inv_dec)
+```
+
+Enfin ici, la population moyenne des communes voisines, pondérée par la distance, réduit les montants investis de -0,63, avec un effet indirect important -0,37. L'emploi moyen des communes voisines (pondéré par la distance) augmente l'investissement (0,36), avec une contribution indirecte dominante (0,21). L'endettement reste le facteur le plus puissant encore une fois, avec un effet total très élevé (0,84), dont plus de la moitié provient des effets indirects.
+
+Conclusion pour ce modèle :
+
+Le modèle de Durbin révèle que les dépenses communales dépendent fortement de celles de leurs voisines ainsi que des caractéristiques spatiales de leur environnement. Pour les dépenses de fonctionnement, la population moyenne des communes voisines réduit les dépenses locales et dans les communes proches, tandis que l'emploi moyen des communes voisines les augmente. Pour les dépenses d' investissements, l'endettement et l'emploi moyen des communes voisines favorisent les projets, et la population moyenne des communes voisines a un effet négatif. Les effets indirects sont souvent très importants, ce qui montre une forte diffusion spatiale entre communes proches. La matrice de distance capture le mieux cette interaction. Une fois de plus, le temps de calcul avec stsls est vraiment plus faible qu'avec ML.
+
+
+**Conclusion sur les deux modèle (SAR et Durbin) :**
+
+Les deux modèles confirment une dépendance spatiale forte des dépenses communales. Les dépenses de fonctionnement sont très influencées par les communes voisines, surtout via les équipements scolaires et la population, tandis que les dépenses d'investissement dépendent surtout de l'endettement et de l'emploi. Le modèle de Durbin, en intégrant les variables explicatives retardées spatialement (population et emploi moyens des communes voisines) met mieux en évidence les effets indirects et la diffusion des comportements budgétaires entre territoires proches. Dans tous les cas, la matrice de distance avec seuil est la plus adaptée pour capturer ces interactions spatiales.
