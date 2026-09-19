@@ -34,7 +34,6 @@ Projet d'économétrie spatiale - Analyse des déterminants des dépenses commun
 * `Projet_économétrie_ARA.pdf` : rapport compilé
 * `Evaluation économétrie spatiale.pdf` : énoncé/grille d'évaluation du projet
 * `commune.shp`, `.dbf`, `.prj`, `.shx` : fonds de carte des communes françaises (format shapefile)
-* `Projet_econometrie.Rproj` : fichier projet RStudio
 
 ## Lancer l'analyse
 
